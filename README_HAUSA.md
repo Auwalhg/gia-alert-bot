@@ -1,20 +1,53 @@
-# GIA Alert Bot v2.0
+# GIA Alert Bot v3.0
 
-Sabbin abubuwa:
-- Gift Code detector
-- Reward extractor
-- GAIN Priority Score
-- HIGH / MEDIUM / LOW priority
-- Cross-channel duplicate filter
-- Official vs Discovery source
-- /stats command
+## Sabbin fasaloli
 
-Commands:
-- /start
-- /stop
-- /status
-- /channels
-- /health
-- /stats
+- GIA AI Brain
+- Hausa + English alerts
+- Gift/Promo/Redeem/Voucher code detection
+- Reward extraction
+- Scam score
+- GAIN priority score
+- CRITICAL / HIGH / MEDIUM / LOW
+- Cross-channel duplicate filtering
+- Evidence Locker in SQLite
+- GAR candidate detection
+- Daily Intelligence Report
+- Weekly Intelligence Report
+- WhatsApp-ready post
+- Official vs Discovery source classification
 
-Public Telegram channels kawai.
+## Commands
+
+- `/start`
+- `/stop`
+- `/status`
+- `/channels`
+- `/health`
+- `/stats`
+- `/daily`
+- `/weekly`
+- `/gar`
+- `/whatsapp`
+
+## Railway variables
+
+Required:
+- `BOT_TOKEN`
+- `GEMINI_API_KEY`
+- `CHANNELS`
+
+Recommended:
+- `ADMIN_CHAT_ID`
+- `OFFICIAL_CHANNELS`
+- `GAR_THRESHOLD=85`
+- `BILINGUAL_ALERTS=true`
+- `DAILY_REPORT_HOUR_UTC=20`
+- `WEEKLY_REPORT_DAY=6`
+
+## Muhimmin iyaka
+
+Wannan version yana bibiyar public Telegram web previews kawai.
+Private channels ko channels da Telegram ya hana web preview ba za su yi aiki ba.
+
+Channels included: 26
