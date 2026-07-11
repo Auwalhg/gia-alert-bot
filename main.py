@@ -1,195 +1,264 @@
-import asyncio
-import html
-import logging
-import os
-import sqlite3
+import asyncio, html, logging, os, re, sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable
 
+import aiohttp
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google import genai
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 
 load_dotenv()
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger("gia-alert-bot")
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),
+                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("gia-production")
 
-def env_required(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+BOT_TOKEN = os.getenv("BOT_TOKEN","").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY","").strip()
+CHANNELS = [x.strip().lstrip("@") for x in os.getenv("CHANNELS","").split(",") if x.strip()]
+CHECK_INTERVAL = max(60, int(os.getenv("CHECK_INTERVAL","300")))
+REQUEST_DELAY = max(1, int(os.getenv("REQUEST_DELAY","2")))
+FIRST_RUN_SILENT = os.getenv("FIRST_RUN_SILENT","true").lower() == "true"
+ALERT_MODE = os.getenv("ALERT_MODE","all").lower()
+MIN_PRIORITY_SCORE = int(os.getenv("MIN_PRIORITY_SCORE","50"))
+DB_PATH = os.getenv("DB_PATH","gia_alert.db")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL","gemini-2.5-flash")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID","").strip()
 
-BOT_TOKEN = env_required("BOT_TOKEN")
-TG_API_ID = int(env_required("TG_API_ID"))
-TG_API_HASH = env_required("TG_API_HASH")
-TG_SESSION = env_required("TG_SESSION")
-GEMINI_API_KEY = env_required("GEMINI_API_KEY")
-CHANNELS = [x.strip().lstrip("@") for x in os.getenv("CHANNELS", "").split(",") if x.strip()]
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
 if not CHANNELS:
-    raise RuntimeError("CHANNELS is empty.")
-
-DB_PATH = os.getenv("DB_PATH", "gia_alert.db")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+    raise RuntimeError("CHANNELS is empty")
 
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.execute("CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY, created_at TEXT NOT NULL)")
-db.execute("CREATE TABLE IF NOT EXISTS processed_posts (channel_key TEXT NOT NULL, message_id INTEGER NOT NULL, processed_at TEXT NOT NULL, PRIMARY KEY(channel_key, message_id))")
+db.execute("CREATE TABLE IF NOT EXISTS subscribers(chat_id INTEGER PRIMARY KEY, created_at TEXT NOT NULL)")
+db.execute("CREATE TABLE IF NOT EXISTS seen_posts(channel TEXT NOT NULL, post_id INTEGER NOT NULL, seen_at TEXT NOT NULL, PRIMARY KEY(channel,post_id))")
+db.execute("CREATE TABLE IF NOT EXISTS channel_health(channel TEXT PRIMARY KEY, last_ok TEXT, last_error TEXT)")
 db.commit()
 
-ai = genai.Client(api_key=GEMINI_API_KEY)
-bot_app = Application.builder().token(BOT_TOKEN).build()
-reader = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
+ai = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+app = Application.builder().token(BOT_TOKEN).build()
 
-def now_utc() -> str:
+@dataclass
+class Post:
+    channel: str
+    post_id: int
+    text: str
+    link: str
+
+def now():
     return datetime.now(timezone.utc).isoformat()
 
-def add_subscriber(chat_id: int) -> None:
-    db.execute("INSERT OR IGNORE INTO subscribers(chat_id, created_at) VALUES (?, ?)", (chat_id, now_utc()))
+def add_subscriber(chat_id):
+    db.execute("INSERT OR IGNORE INTO subscribers(chat_id,created_at) VALUES (?,?)",(chat_id,now()))
     db.commit()
 
-def remove_subscriber(chat_id: int) -> None:
-    db.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
+def remove_subscriber(chat_id):
+    db.execute("DELETE FROM subscribers WHERE chat_id=?",(chat_id,))
     db.commit()
 
-def subscribers() -> list[int]:
-    ids = [int(r[0]) for r in db.execute("SELECT chat_id FROM subscribers")]
+def get_subscribers():
+    ids=[int(r[0]) for r in db.execute("SELECT chat_id FROM subscribers")]
     if ADMIN_CHAT_ID:
         try:
-            admin = int(ADMIN_CHAT_ID)
-            if admin not in ids:
-                ids.append(admin)
+            x=int(ADMIN_CHAT_ID)
+            if x not in ids: ids.append(x)
         except ValueError:
-            logger.warning("ADMIN_CHAT_ID is not valid")
+            pass
     return ids
 
-def was_processed(channel_key: str, message_id: int) -> bool:
-    return db.execute("SELECT 1 FROM processed_posts WHERE channel_key=? AND message_id=?", (channel_key, message_id)).fetchone() is not None
+def seen(channel, post_id):
+    return db.execute("SELECT 1 FROM seen_posts WHERE channel=? AND post_id=?",(channel,post_id)).fetchone() is not None
 
-def mark_processed(channel_key: str, message_id: int) -> None:
-    db.execute("INSERT OR IGNORE INTO processed_posts(channel_key, message_id, processed_at) VALUES (?, ?, ?)", (channel_key, message_id, now_utc()))
+def mark_seen(channel, post_id):
+    db.execute("INSERT OR IGNORE INTO seen_posts(channel,post_id,seen_at) VALUES (?,?,?)",(channel,post_id,now()))
     db.commit()
 
-def split_message(text: str, limit: int = 3900) -> Iterable[str]:
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        if cut < 500:
-            cut = limit
-        yield text[:cut]
-        text = text[cut:].lstrip()
-    if text:
-        yield text
+def seen_count(channel):
+    return db.execute("SELECT COUNT(*) FROM seen_posts WHERE channel=?",(channel,)).fetchone()[0]
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.message:
-        return
-    add_subscriber(update.effective_chat.id)
-    await update.message.reply_text("✅ An kunna GIA Alert Bot.\n\nZan turo maka sabbin updates tare da fassarar Hausa da GIA risk note.\n\nYi amfani da /status domin duba channels.")
+def set_health(channel, ok, message=""):
+    if ok:
+        db.execute("INSERT INTO channel_health(channel,last_ok,last_error) VALUES (?,?,NULL) ON CONFLICT(channel) DO UPDATE SET last_ok=excluded.last_ok,last_error=NULL",(channel,now()))
+    else:
+        db.execute("INSERT INTO channel_health(channel,last_ok,last_error) VALUES (?,NULL,?) ON CONFLICT(channel) DO UPDATE SET last_error=excluded.last_error",(channel,message[:300]))
+    db.commit()
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.message:
-        return
-    remove_subscriber(update.effective_chat.id)
-    await update.message.reply_text("⛔ An dakatar da alerts zuwa wannan chat.")
+def classify(text):
+    t=text.lower()
+    checks=[
+        ("Security Alert",90,["hack","scam","phishing","exploit","security alert"]),
+        ("Gift Code",85,["gift code","secret node","promo code","redeem code","code:"]),
+        ("Listing",80,["listing","listed on","trading pair","tge"]),
+        ("Airdrop",75,["airdrop","claim","eligibility","snapshot"]),
+        ("Task",65,["task","campaign","complete","reward"]),
+        ("Mining",60,["mining","mine","hashrate","base rate"]),
+        ("News",45,["announcement","update","partnership","roadmap"]),
+    ]
+    for name,score,words in checks:
+        if any(w in t for w in words):
+            return name,score
+    return "Other",20
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    body = "\n".join(f"• @{name}" for name in CHANNELS)
-    await update.message.reply_text(f"🟢 GIA Alert Bot yana aiki.\n\n📡 Jimillar channels: {len(CHANNELS)}\n\n{body}")
+def fallback(post, category, score):
+    return (
+        f"📌 Nau'in Update: {category}\n"
+        "📝 Takaitaccen Bayani: An samu sabon post daga channel ɗin da ake bibiya.\n"
+        "✅ Abin da ake Buƙatar Yi: Buɗe original post domin cikakken bayani.\n"
+        "🎁 Lada/Fa'ida: Ba a tantance ba.\n"
+        "⏰ Wa'adi: Ba a tantance ba.\n"
+        "🛡️ Matsayin Tabbaci: Discovery source — sai an tabbatar daga official channel.\n"
+        f"📊 GIA Priority Score: {score}/100\n"
+        "⚠️ Haɗari ko Abin Lura: Kada a biya kuɗi ko haɗa wallet sai an tabbatar."
+    )
 
-def analyze_post(source_name: str, text: str, post_link: str) -> str:
-    prompt = f"""Kai ne GIA Crypto Intelligence Translator da Risk Screener.
+def analyze(post, category, score):
+    if not ai:
+        return fallback(post,category,score)
+    prompt=f'''
+Ka amsa da Hausa kawai.
+Ka fassara wannan Telegram post zuwa Hausa mai sauƙi.
+Kada ka ƙirƙiri bayanin da babu shi.
+Idan akwai gift code, ka fito da code da reward a sarari.
+Idan akwai task, airdrop, listing, mining, deadline ko security alert, ka bayyana.
+Ka rubuta cewa sai an tabbatar daga official channel idan source ɗin discovery ne.
 
-Ka amsa da HAUSA kawai.
-Ka fassara post din zuwa Hausa mai saukin fahimta.
-Kada ka kirkiri bayanin da babu shi.
-Kada ka ce project verified sai an nuna hujjar official source.
-Idan hujja ba ta isa ba, rubuta 'Ba a tabbatar ba'.
-Idan akwai gift code, ka fito da code din da reward dinsa a sarari.
-Idan akwai airdrop, task, mining, listing, security alert ko deadline, ka bayyana shi.
-
-Ka yi amfani da wannan tsari:
-
+Tsari:
 📌 Nau'in Update:
 📝 Takaitaccen Bayani:
-✅ Abin da ake Bukatar Yi:
+✅ Abin da ake Buƙatar Yi:
 🎁 Lada/Fa'ida:
 ⏰ Wa'adi:
 🛡️ Matsayin Tabbaci:
-⚠️ Hadari ko Abin Lura:
+📊 GIA Priority Score: {score}/100
+⚠️ Haɗari ko Abin Lura:
 
-Source: {source_name}
-Post link: {post_link}
+Source: @{post.channel}
+Link: {post.link}
+Original:
+{post.text}
+'''
+    res=ai.models.generate_content(model=GEMINI_MODEL,contents=prompt)
+    return (res.text or fallback(post,category,score)).strip()
 
-Original post:
-{text}"""
-    response = ai.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-    return (response.text or "Ba a samu fassara ba.").strip()
+async def fetch_channel(session, channel):
+    url=f"https://t.me/s/{channel}"
+    headers={"User-Agent":"Mozilla/5.0"}
+    async with session.get(url,headers=headers,timeout=aiohttp.ClientTimeout(total=30)) as r:
+        if r.status != 200:
+            raise RuntimeError(f"HTTP {r.status}")
+        page=await r.text()
+    soup=BeautifulSoup(page,"html.parser")
+    out=[]
+    for wrap in soup.select(".tgme_widget_message_wrap"):
+        msg=wrap.select_one(".tgme_widget_message")
+        if not msg: continue
+        data=msg.get("data-post","")
+        m=re.search(r"/(\d+)$",data)
+        if not m: continue
+        pid=int(m.group(1))
+        text_el=wrap.select_one(".tgme_widget_message_text")
+        text=text_el.get_text("\n",strip=True) if text_el else "[Media post ba tare da rubutu ba]"
+        link_el=wrap.select_one("a.tgme_widget_message_date")
+        link=link_el.get("href") if link_el and link_el.get("href") else f"https://t.me/{channel}/{pid}"
+        out.append(Post(channel,pid,text,link))
+    return out
 
-async def broadcast(message: str) -> None:
-    targets = subscribers()
-    if not targets:
-        logger.warning("Babu subscriber. A bude bot a tura /start.")
+async def send_alert(text):
+    for chat_id in get_subscribers():
+        try:
+            await app.bot.send_message(chat_id=chat_id,text=text,parse_mode=ParseMode.HTML,disable_web_page_preview=True)
+        except Exception:
+            log.exception("Send failed to %s",chat_id)
+
+async def process(post):
+    category,score=classify(post.text)
+    if ALERT_MODE=="priority" and score < MIN_PRIORITY_SCORE:
+        mark_seen(post.channel,post.post_id)
         return
-    for chat_id in targets:
-        for part in split_message(message):
-            try:
-                await bot_app.bot.send_message(chat_id=chat_id, text=part, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            except Exception:
-                logger.exception("Failed to send alert to %s", chat_id)
+    hausa=await asyncio.to_thread(analyze,post,category,score)
+    msg=(
+        "🚨 <b>GIA INTELLIGENCE ALERT</b>\n\n"
+        f"📡 <b>Source:</b> @{html.escape(post.channel)}\n"
+        f"🔗 <b>Original:</b> {html.escape(post.link)}\n\n"
+        f"{html.escape(hausa)}\n\n"
+        "🧭 <b>Evidence Before Emotion — Bincike Kafin Shawara.</b>"
+    )
+    await send_alert(msg)
+    mark_seen(post.channel,post.post_id)
 
-@reader.on(events.NewMessage(chats=CHANNELS))
-async def on_new_post(event) -> None:
-    try:
-        chat = await event.get_chat()
-        username = getattr(chat, "username", None)
-        title = getattr(chat, "title", None) or username or "Telegram Channel"
-        channel_key = username or str(event.chat_id)
-        message_id = int(event.message.id)
-        if was_processed(channel_key, message_id):
+async def monitor_loop():
+    await asyncio.sleep(5)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            for channel in CHANNELS:
+                try:
+                    posts=await fetch_channel(session,channel)
+                    posts.sort(key=lambda p:p.post_id)
+                    latest=posts[-8:]
+                    if FIRST_RUN_SILENT and seen_count(channel)==0:
+                        for p in latest: mark_seen(channel,p.post_id)
+                        set_health(channel,True)
+                        await asyncio.sleep(REQUEST_DELAY)
+                        continue
+                    for p in latest:
+                        if not seen(channel,p.post_id):
+                            await process(p)
+                    set_health(channel,True)
+                except Exception as e:
+                    set_health(channel,False,str(e))
+                    log.exception("Channel failed: %s",channel)
+                await asyncio.sleep(REQUEST_DELAY)
+            await asyncio.sleep(CHECK_INTERVAL)
+
+async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.message:
+        add_subscriber(update.effective_chat.id)
+        await update.message.reply_text("✅ An kunna GIA Alert Bot.")
+
+async def stop_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.message:
+        remove_subscriber(update.effective_chat.id)
+        await update.message.reply_text("⛔ An dakatar da alerts.")
+
+async def status_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text(f"🟢 Bot yana aiki.\n📡 Channels: {len(CHANNELS)}\n⏱️ Interval: {CHECK_INTERVAL}s\n🎯 Mode: {ALERT_MODE}")
+
+async def channels_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text("📡 Channels:\n\n" + "\n".join(f"• @{c}" for c in CHANNELS))
+
+async def health_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        rows=db.execute("SELECT channel,last_ok,last_error FROM channel_health ORDER BY channel").fetchall()
+        if not rows:
+            await update.message.reply_text("Babu health data tukuna.")
             return
-        original_text = (event.raw_text or "").strip() or "[Post din media ne ba tare da rubutu ba. A bude original post domin ganin hoton ko bidiyon.]"
-        post_link = f"https://t.me/{username}/{message_id}" if username else "Babu public post link"
-        analysis = await asyncio.to_thread(analyze_post, title, original_text, post_link)
-        alert = (
-            "🚨 <b>GIA INTELLIGENCE ALERT</b>\n\n"
-            f"📡 <b>Source:</b> {html.escape(title)}\n"
-            f"🔗 <b>Original Post:</b> {html.escape(post_link)}\n\n"
-            f"{html.escape(analysis)}\n\n"
-            "━━━━━━━━━━━━━━\n"
-            "🧭 <b>Evidence Before Emotion — Bincike Kafin Shawara.</b>"
-        )
-        await broadcast(alert)
-        mark_processed(channel_key, message_id)
-        logger.info("Processed %s/%s", channel_key, message_id)
-    except Exception:
-        logger.exception("Error while processing a Telegram post")
+        lines=[f"{'✅' if ok and not err else '⚠️'} @{ch}" for ch,ok,err in rows[:40]]
+        await update.message.reply_text("🩺 Channel Health:\n\n" + "\n".join(lines))
 
-async def main() -> None:
-    bot_app.add_handler(CommandHandler("start", cmd_start))
-    bot_app.add_handler(CommandHandler("stop", cmd_stop))
-    bot_app.add_handler(CommandHandler("status", cmd_status))
-    await bot_app.initialize()
-    await bot_app.start()
-    if bot_app.updater is None:
-        raise RuntimeError("Telegram updater is unavailable")
-    await bot_app.updater.start_polling(drop_pending_updates=True)
-    await reader.start()
-    logger.info("GIA Alert Bot started with %s channels", len(CHANNELS))
+async def main():
+    app.add_handler(CommandHandler("start",start_cmd))
+    app.add_handler(CommandHandler("stop",stop_cmd))
+    app.add_handler(CommandHandler("status",status_cmd))
+    app.add_handler(CommandHandler("channels",channels_cmd))
+    app.add_handler(CommandHandler("health",health_cmd))
+    await app.initialize()
+    await app.start()
+    if app.updater is None: raise RuntimeError("Updater unavailable")
+    await app.updater.start_polling(drop_pending_updates=True)
+    task=asyncio.create_task(monitor_loop())
     try:
-        await reader.run_until_disconnected()
+        await task
     finally:
-        if bot_app.updater:
-            await bot_app.updater.stop()
-        await bot_app.stop()
-        await bot_app.shutdown()
+        task.cancel()
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
         db.close()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())

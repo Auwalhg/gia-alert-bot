@@ -1,21 +1,30 @@
-# GIA Alert Bot — Final Version
+# GIA Alert Bot — Production v1.0
 
-Wannan version din yana bibiyar channels guda 26.
+Wannan version yana aiki ba tare da TG_SESSION ba.
 
-## Secrets/Variables
+Aiki:
+- Bibiyar public Telegram channels
+- Fassara sabbin posts zuwa Hausa
+- Gift Code / Airdrop / Listing / Task / Mining / Security classification
+- GIA Priority Score
+- Duplicate protection
+- Channel health
+- Commands: /start /stop /status /channels /health
+
+Muhimmin iyaka:
+- Public channels kawai
+- Private channels ba za su yi aiki ba
+- Idan Telegram ya hana web preview, wannan channel ba zai iya karantawa ba
+
+Railway variables:
 - BOT_TOKEN
-- TG_API_ID
-- TG_API_HASH
-- TG_SESSION
 - GEMINI_API_KEY
 - CHANNELS
 
-## Kunna bot
-1. Upload files zuwa GitHub.
-2. Deploy zuwa Railway.
-3. Saka Variables.
-4. Bude @GIAAlertHQBot ka tura /start.
-5. Tura /status.
+Optional:
+- ADMIN_CHAT_ID
+- CHECK_INTERVAL
+- ALERT_MODE
+- MIN_PRIORITY_SCORE
 
-## Tsaro
-Kada ka saka BOT_TOKEN, TG_API_HASH, TG_SESSION ko GEMINI_API_KEY a GitHub.
+Channels included: 26
